@@ -1,0 +1,3 @@
+# requirements.txt: 項目依賴（Dynamo專用，無需安裝）
+ironpython==2.7.8  # Dynamo使用IronPython版本
+# Revit API由Revit提供，無需列出
