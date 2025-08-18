@@ -1,5 +1,5 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.2
+# 版本：1.3
 # 作者：Kenneth Law
 # 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
@@ -36,7 +36,7 @@ uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
 # 定義常量
 EPSILON = 0.01  # 小偏移用於找房間
 logs = []  # 日誌列表：成功/失敗記錄
-log_dir = r"D:\Users\User\Desktop\test"  # 指定 LOG 目錄
+log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 更新：指定 LOG 目錄
 log_file_name = "log.txt"  # 指定檔案名
 log_path = os.path.join(log_dir, log_file_name)  # 完整路徑
 
@@ -60,14 +60,14 @@ def get_adjacent_room(face):
     point_on_face = face.Evaluate(uv)  # 獲取點
     normal = face.FaceNormal  # 獲取法線
     # 偏移到房間側（法線指向外，偏移正方向進入房間）
-    offset_vector = normal.Multiply(EPSILON)  # 修正：使用 Multiply 方法
-    offset_point = point_on_face + offset_vector
+    offset_vector = normal.Multiply(EPSILON)  # 使用 Multiply 方法
+    offset_point = point_on_face.Add(offset_vector)  # 修正：使用 Add 方法
     room = doc.GetRoomAtPoint(offset_point)
     if room:
         return room
     # 如果無，試反方向（視牆方向）
-    offset_vector_rev = normal.Multiply(-EPSILON)  # 修正：使用 Multiply 方法
-    offset_point_rev = point_on_face + offset_vector_rev
+    offset_vector_rev = normal.Multiply(-EPSILON)  # 使用 Multiply 方法
+    offset_point_rev = point_on_face.Add(offset_vector_rev)  # 修正：使用 Add 方法
     room_rev = doc.GetRoomAtPoint(offset_point_rev)
     return room_rev
 
