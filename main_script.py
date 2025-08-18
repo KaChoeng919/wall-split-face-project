@@ -1,156 +1,166 @@
-# 導入必要模組
+# 模組：自動分割 Revit 牆體面基於相連房間高度
+# 版本：1.1
+# 作者：Kenneth Law
+# 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float），並分割面從底部到該高度。
+# 依賴：Revit 2023, Dynamo 2.16.2, IronPython
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。
+
 import clr
+import sys
+import math
+import os  # 用於處理檔案路徑和目錄檢查
+
+# 導入 Revit API 和 Dynamo 模組
+clr.AddReference('ProtoGeometry')
+from Autodesk.DesignScript.Geometry import *
+
 clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.DB.Architecture import Room
+
+clr.AddReference('RevitNodes')
+import Revit
+clr.ImportExtensions(Revit.Elements)
+clr.ImportExtensions(Revit.GeometryConversion)
+
 clr.AddReference('RevitServices')
 import RevitServices
 from RevitServices.Persistence import DocumentManager
 from RevitServices.Transactions import TransactionManager
-from Autodesk.Revit.DB import *
-from Autodesk.Revit.DB.Architecture import *
-from System.Collections.Generic import List  # 用於ICollection
 
-# 額外導入用於檔案操作和目錄創建
-import os
-import datetime
-
+# 獲取當前文檔
 doc = DocumentManager.Instance.CurrentDBDocument
+uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
 
-# 輸出變數：成功和失敗記錄
-success_log = []
-failed_log = []
+# 定義常量
+EPSILON = 0.01  # 小偏移用於找房間
+logs = []  # 日誌列表：成功/失敗記錄
+log_dir = r"D:\Users\User\Desktop\test"  # 更新：指定 LOG 目錄
+log_file_name = "log.txt"  # 更新：指定檔案名
+log_path = os.path.join(log_dir, log_file_name)  # 完整路徑
 
-# 開始事務（所有修改需在事務內）
+def get_vertical_faces(wall):
+    """獲取牆體的垂直平面面"""
+    options = Options()
+    options.ComputeReferences = True
+    options.IncludeNonVisibleObjects = True
+    geo_elem = wall.get_Geometry(options)
+    faces = []
+    for geo in geo_elem:
+        if isinstance(geo, Solid):
+            for face in geo.Faces:
+                if isinstance(face, PlanarFace) and math.fabs(face.FaceNormal.DotProduct(XYZ.BasisZ)) < 0.01:  # 垂直面（法線非Z軸）
+                    faces.append(face)
+    return faces
+
+def get_adjacent_room(face):
+    """找相連房間：從面點沿法線偏移，獲取房間"""
+    uv = UV(0.5, 0.5)  # 面中心UV
+    point_on_face = face.Evaluate(uv)  # 修正：使用 Evaluate(uv) 獲取點
+    normal = face.FaceNormal  # 修正：使用 FaceNormal 獲取法線（PlanarFace 恆定）
+    # 偏移到房間側（法線指向外，偏移正方向進入房間）
+    offset_point = point_on_face + normal * EPSILON
+    room = doc.GetRoomAtPoint(offset_point)
+    if room:
+        return room
+    # 如果無，試反方向（視牆方向）
+    offset_point_rev = point_on_face - normal * EPSILON
+    room_rev = doc.GetRoomAtPoint(offset_point_rev)
+    return room_rev
+
+def calculate_room_height(room):
+    """從房間的 'Headroom Requirement' 參數（Text, Instance）計算高度"""
+    if room:
+        param = room.LookupParameter("Headroom Requirement")  # 查找參數
+        if param and param.StorageType == StorageType.String:
+            try:
+                return float(param.AsString())  # 轉換 Text 為 float
+            except ValueError:
+                return None  # 無效字符串
+    return None
+
+def create_split_profile(face, height):
+    """創建 CurveLoop 輪廓：從底部到高度的矩形（簡化假設矩形面）"""
+    # 獲取面邊界邊
+    edge_loop = face.EdgeLoops.get_Item(0)  # 假設單一閉合邊界
+    curves = [edge.AsCurve() for edge in edge_loop]
+    
+    # 找最小/最大 Z，假設垂直矩形
+    min_z = min(curve.GetEndPoint(0).Z for curve in curves)
+    max_z = max(curve.GetEndPoint(0).Z for curve in curves)
+    
+    if height >= (max_z - min_z) or height <= 0:
+        return None  # 無效高度
+    
+    new_height_z = min_z + height
+    
+    # 創建新輪廓：底部線、左右垂直、頂部水平（需調整點）
+    points = [curve.GetEndPoint(0) for curve in curves] + [curves[0].GetEndPoint(0)]  # 閉合點
+    bottom_left = min(points, key=lambda p: p.X + p.Y)  # 簡化查找角點
+    bottom_right = max(points, key=lambda p: p.X - p.Y)
+    top_left = min(points, key=lambda p: -p.X + p.Y)
+    top_right = max(points, key=lambda p: p.X + p.Y)
+    
+    # 調整頂點到新高度
+    new_top_left = XYZ(top_left.X, top_left.Y, new_height_z)
+    new_top_right = XYZ(top_right.X, top_right.Y, new_height_z)
+    
+    # 創建曲線
+    bottom = Line.CreateBound(bottom_left, bottom_right)
+    left = Line.CreateBound(bottom_left, new_top_left)
+    top = Line.CreateBound(new_top_left, new_top_right)
+    right = Line.CreateBound(new_top_right, bottom_right)
+    
+    profile = CurveLoop()
+    profile.Append(bottom)
+    profile.Append(right)
+    profile.Append(top)
+    profile.Append(left)
+    return profile
+
+# 主邏輯
 TransactionManager.Instance.EnsureInTransaction(doc)
 
-try:
-    # 收集所有牆體（排除幕牆等非標準）
-    wall_collector = FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType()
-    walls = wall_collector.ToElements()
-    
-    for wall in walls:
-        try:
-            # 獲取牆體的側面（排除頂/底面）
-            options = Options()
-            options.ComputeReferences = True
-            options.IncludeNonVisibleObjects = True
-            geometry = wall.get_Geometry(options)
-            
-            side_faces = []
-            for geo_obj in geometry:
-                if isinstance(geo_obj, Solid):
-                    for face in geo_obj.Faces:
-                        # 檢查面法線是否接近水平（側面通常垂直，法線接近水平）
-                        if abs(face.FaceNormal.Z) < 0.1:  # 調整閾值以過濾垂直側面
-                            side_faces.append(face)
-            
-            if not side_faces:
-                failed_log.append("Wall ID {}: No side faces found.".format(wall.Id))
+walls = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Walls).WhereElementIsNotElementType().ToElements()
+
+for wall in walls:
+    try:
+        faces = get_vertical_faces(wall)
+        for face in faces:
+            room = get_adjacent_room(face)
+            if not room:
+                logs.append("Wall {} Face: No adjacent room found.".format(wall.Id))
                 continue
             
-            # 記錄找到的面數以追蹤
-            success_log.append("Wall ID {}: Found {} side faces.".format(wall.Id, len(side_faces)))
+            height = calculate_room_height(room)
+            if not height:
+                logs.append("Wall {} Face: Invalid room height from 'Headroom Requirement'.".format(wall.Id))
+                continue
             
-            for face in side_faces:
-                try:
-                    # 找相連房間：從面中心偏移小距離，獲取點處房間
-                    normal = face.FaceNormal
-                    uv_center = UV(0.5, 0.5)
-                    center_point = face.Evaluate(uv_center)
-                    offset_distance = 0.1  # 英呎，小偏移避免邊界問題；如果仍無房間，試增大到0.5
-                    # 使用 Multiply 方法避免運算符錯誤
-                    offset_vector_inside = normal.Multiply(-offset_distance)
-                    offset_vector_outside = normal.Multiply(offset_distance)
-                    sample_point_inside = center_point.Add(offset_vector_inside)
-                    sample_point_outside = center_point.Add(offset_vector_outside)
-                    
-                    # 檢查兩側
-                    rooms = []
-                    room_inside = doc.GetRoomAtPoint(sample_point_inside)
-                    if room_inside:
-                        rooms.append(room_inside)
-                    room_outside = doc.GetRoomAtPoint(sample_point_outside)
-                    if room_outside and room_outside != room_inside:
-                        rooms.append(room_outside)
-                    
-                    if not rooms:
-                        failed_log.append("Wall ID {} Face: No adjacent rooms found at offset {}. Try increasing offset.".format(wall.Id, offset_distance))
-                        continue
-                    
-                    for room in rooms:
-                        try:
-                            # 獲取房間高度（UnboundedHeight若為0，則計算上下限）
-                            height = room.UnboundedHeight
-                            if height == 0:
-                                base_elev = room.Level.Elevation + room.BaseOffset
-                                upper_elev = room.UpperLimit.Elevation + room.LimitOffset
-                                height = upper_elev - base_elev
-                            
-                            # 計算分割高度（相對於牆基底，包括偏移）
-                            wall_base_constraint_id = wall.get_Parameter(BuiltInParameter.WALL_BASE_CONSTRAINT).AsElementId()
-                            wall_base_level = doc.GetElement(wall_base_constraint_id)
-                            wall_base_offset = wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET).AsDouble()
-                            split_height = wall_base_level.Elevation + wall_base_offset + height
-                            
-                            # 創建 SketchPlane on Face
-                            sketch_plane = SketchPlane.Create(doc, face.Reference)
-                            
-                            # 定義水平線：從面邊界找 min/max，簡化為矩形假設
-                            boundary_loops = face.GetEdgesAsCurveLoops()
-                            if boundary_loops:
-                                min_xyz = XYZ(float('inf'), float('inf'), float('inf'))
-                                max_xyz = XYZ(float('-inf'), float('-inf'), float('-inf'))
-                                for loop in boundary_loops:
-                                    for curve in loop:
-                                        start = curve.GetEndPoint(0)
-                                        end = curve.GetEndPoint(1)
-                                        min_xyz = XYZ(min(min_xyz.X, start.X, end.X), min(min_xyz.Y, start.Y, end.Y), min(min_xyz.Z, start.Z, end.Z))
-                                        max_xyz = XYZ(max(max_xyz.X, start.X, end.X), max(max_xyz.Y, start.Y, end.Y), max(max_xyz.Z, start.Z, end.Z))
-                                
-                                # 創建水平線：假設X為寬度，Y為深度，Z為高度；調整為水平（固定Z）
-                                line_start = XYZ(min_xyz.X, (min_xyz.Y + max_xyz.Y)/2, split_height)  # 中Y以居中
-                                line_end = XYZ(max_xyz.X, (min_xyz.Y + max_xyz.Y)/2, split_height)
-                                line = Line.CreateBound(line_start, line_end)
-                                
-                                # 創建 ModelCurve
-                                model_curve = doc.Create.NewModelCurve(line, sketch_plane)
-                                
-                                # 記錄成功
-                                success_log.append("Wall ID {} Face adjacent to Room '{}': Height = {}, Model Curve created at height {}.".format(wall.Id, room.Name, height, split_height))
-                            
-                        except Exception as room_ex:
-                            failed_log.append("Wall ID {} Room '{}': Error getting height or creating curve - {}".format(wall.Id, room.Name, str(room_ex)))
-                
-                except Exception as face_ex:
-                    failed_log.append("Wall ID {} Face: Error processing face - {}".format(wall.Id, str(face_ex)))
-        
-        except Exception as wall_ex:
-            failed_log.append("Wall ID {}: Error processing wall - {}".format(wall.Id, str(wall_ex)))
-
-except Exception as global_ex:
-    failed_log.append("Global error: {}".format(str(global_ex)))
+            profile = create_split_profile(face, height)
+            if not profile:
+                logs.append("Wall {} Face: Invalid profile for height {}.".format(wall.Id, height))
+                continue
+            
+            new_face = doc.SplitFace(face, profile)
+            logs.append("Wall {} Face split successfully at height {}. New face ID: {}".format(wall.Id, height, new_face.Id))
+    
+    except Exception as e:
+        logs.append("Error on Wall {}: {}".format(wall.Id, str(e)))
 
 TransactionManager.Instance.TransactionTaskDone()
 
-# 加入 LOG 輸出到指定路徑
-log_path = r"D:\Users\User\Desktop\test\Wall Split Face"
-if not os.path.exists(log_path):
-    os.makedirs(log_path)
+# 更新：檢查並創建目錄，寫入日誌到檔案
+try:
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)  # 創建目錄如果不存在
+    with open(log_path, 'w') as log_file:
+        for log in logs:
+            log_file.write(log + '\n')
+    logs.append("Logs successfully written to {}".format(log_path))
+except Exception as e:
+    logs.append("Error writing logs: {}".format(str(e)))
 
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# 寫入 success_log.txt
-success_file = os.path.join(log_path, "success_log.txt")
-with open(success_file, "w") as f:
-    f.write("Run Time: {}\n".format(timestamp))
-    for entry in success_log:
-        f.write(entry + "\n")
-
-# 寫入 failed_log.txt
-failed_file = os.path.join(log_path, "failed_log.txt")
-with open(failed_file, "w") as f:
-    f.write("Run Time: {}\n".format(timestamp))
-    for entry in failed_log:
-        f.write(entry + "\n")
-
-# 輸出到Dynamo: [成功日誌, 失敗日誌]
-OUT = success_log, failed_log
+# 輸出日誌（Dynamo OUT 仍保留，便於即時檢查）
+OUT = logs
