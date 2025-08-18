@@ -1,9 +1,9 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.5
+# 版本：1.6
 # 作者：Kenneth Law
 # 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float，假設 mm 轉 ft），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
-# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。新增單位轉換、多偏移嘗試和 phase 指定。
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。新增 ShortCurveTolerance 檢查以避免短曲線錯誤。
 
 import clr
 import sys
@@ -29,13 +29,15 @@ import RevitServices
 from RevitServices.Persistence import DocumentManager
 from RevitServices.Transactions import TransactionManager
 
-# 獲取當前文檔
+# 獲取當前文檔和應用程式
 doc = DocumentManager.Instance.CurrentDBDocument
 uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
+app = DocumentManager.Instance.CurrentUIApplication.Application
 
 # 定義常量
-EPSILONS = [0.01, 0.1, 0.5, 1.0]  # 更新：多偏移嘗試以改善房間偵測
-MM_TO_FEET = 1 / 304.8  # 更新：毫米到英尺轉換因子 (Revit 內部單位為 ft)
+EPSILONS = [0.01, 0.1, 0.5, 1.0]  # 多偏移嘗試以改善房間偵測
+MM_TO_FEET = 1 / 304.8  # 毫米到英尺轉換因子 (Revit 內部單位為 ft)
+TOLERANCE = app.ShortCurveTolerance * 1.01  # 更新：短曲線容差（稍大以安全）
 logs = []  # 日誌列表：成功/失敗記錄
 log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 指定 LOG 目錄
 log_file_name = "log.txt"  # 指定檔案名
@@ -98,14 +100,21 @@ def calculate_room_height(room):
     return None
 
 def create_split_profile(face, height):
-    """創建 CurveLoop 輪廓：從底部到高度的矩形（簡化假設矩形面）"""
+    """創建 CurveLoop 輪廓：從底部到高度的矩形（簡化假設矩形面，新增容差檢查）"""
     # 獲取面邊界邊
     edge_loop = face.EdgeLoops.get_Item(0)  # 假設單一閉合邊界
     curves = [edge.AsCurve() for edge in edge_loop]
     
-    # 找最小/最大 Z，假設垂直矩形
-    min_z = min(curve.GetEndPoint(0).Z for curve in curves)
-    max_z = max(curve.GetEndPoint(0).Z for curve in curves)
+    # 提取所有唯一端點
+    points = []
+    for curve in curves:
+        points.append(curve.GetEndPoint(0))
+        points.append(curve.GetEndPoint(1))
+    points = list(set(points))  # 移除重複
+    
+    # 找最小/最大 Z
+    min_z = min(p.Z for p in points)
+    max_z = max(p.Z for p in points)
     wall_height = max_z - min_z
     
     if height >= wall_height or height <= 0:
@@ -114,22 +123,34 @@ def create_split_profile(face, height):
     
     new_height_z = min_z + height
     
-    # 創建新輪廓：底部線、左右垂直、頂部水平（需調整點）
-    points = [curve.GetEndPoint(0) for curve in curves] + [curves[0].GetEndPoint(0)]  # 閉合點
-    bottom_left = min(points, key=lambda p: p.X + p.Y)  # 簡化查找角點
-    bottom_right = max(points, key=lambda p: p.X - p.Y)
-    top_left = min(points, key=lambda p: -p.X + p.Y)
-    top_right = max(points, key=lambda p: p.X + p.Y)
+    # 改善角點選擇：過濾底點 (Z ≈ min_z)，找 min/max X/Y
+    bottom_points = [p for p in points if abs(p.Z - min_z) < TOLERANCE]
+    if len(bottom_points) < 2:
+        logs.append("Invalid profile: Insufficient bottom points.")
+        return None
     
-    # 調整頂點到新高度
-    new_top_left = XYZ(top_left.X, top_left.Y, new_height_z)
-    new_top_right = XYZ(top_right.X, top_right.Y, new_height_z)
+    bottom_left = min(bottom_points, key=lambda p: p.X + p.Y)
+    bottom_right = max(bottom_points, key=lambda p: p.X - p.Y)
     
-    # 創建曲線
-    bottom = Line.CreateBound(bottom_left, bottom_right)
-    left = Line.CreateBound(bottom_left, new_top_left)
-    top = Line.CreateBound(new_top_left, new_top_right)
-    right = Line.CreateBound(new_top_right, bottom_right)
+    # 對應頂點：複製底點調整 Z
+    new_top_left = XYZ(bottom_left.X, bottom_left.Y, new_height_z)
+    new_top_right = XYZ(bottom_right.X, bottom_right.Y, new_height_z)
+    
+    # 創建曲線前檢查距離
+    def create_line_safe(p1, p2):
+        dist = p1.DistanceTo(p2)
+        if dist < TOLERANCE:
+            logs.append("Skipping line: Distance {} ft < tolerance {} ft.".format(dist, TOLERANCE))
+            return None
+        return Line.CreateBound(p1, p2)
+    
+    bottom = create_line_safe(bottom_left, bottom_right)
+    left = create_line_safe(bottom_left, new_top_left)
+    top = create_line_safe(new_top_left, new_top_right)
+    right = create_line_safe(new_top_right, bottom_right)
+    
+    if None in [bottom, left, top, right]:
+        return None
     
     profile = CurveLoop()
     profile.Append(bottom)
