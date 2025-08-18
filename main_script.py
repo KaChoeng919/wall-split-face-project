@@ -1,9 +1,9 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.4
+# 版本：1.5
 # 作者：Kenneth Law
-# 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float），並分割面從底部到該高度。
+# 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float，假設 mm 轉 ft），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
-# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。增加 EPSILON 以改善房間偵測。
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。新增單位轉換、多偏移嘗試和 phase 指定。
 
 import clr
 import sys
@@ -34,11 +34,15 @@ doc = DocumentManager.Instance.CurrentDBDocument
 uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
 
 # 定義常量
-EPSILON = 0.1  # 更新：增加偏移用於找房間（單位依項目，通常英尺）
+EPSILONS = [0.01, 0.1, 0.5, 1.0]  # 更新：多偏移嘗試以改善房間偵測
+MM_TO_FEET = 1 / 304.8  # 更新：毫米到英尺轉換因子 (Revit 內部單位為 ft)
 logs = []  # 日誌列表：成功/失敗記錄
 log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 指定 LOG 目錄
 log_file_name = "log.txt"  # 指定檔案名
 log_path = os.path.join(log_dir, log_file_name)  # 完整路徑
+
+# 獲取最後階段
+phase = doc.Phases.get_Item(doc.Phases.Size - 1) if doc.Phases.Size > 0 else None
 
 def get_vertical_faces(wall):
     """獲取牆體的垂直平面面"""
@@ -55,36 +59,38 @@ def get_vertical_faces(wall):
     return faces
 
 def get_adjacent_room(face):
-    """找相連房間：從面點沿法線偏移，獲取房間"""
+    """找相連房間：從面點沿法線偏移，獲取房間（多偏移嘗試和 phase 指定）"""
     uv = UV(0.5, 0.5)  # 面中心UV
     point_on_face = face.Evaluate(uv)  # 獲取點
     normal = face.FaceNormal  # 獲取法線
-    # 偏移到房間側（法線指向外，偏移正方向進入房間）
-    offset_vector = normal.Multiply(EPSILON)
-    offset_point = point_on_face.Add(offset_vector)
-    room = doc.GetRoomAtPoint(offset_point)
-    if room:
-        return room
-    # 如果無，試反方向（視牆方向）
-    offset_vector_rev = normal.Multiply(-EPSILON)
-    offset_point_rev = point_on_face.Add(offset_vector_rev)
-    room_rev = doc.GetRoomAtPoint(offset_point_rev)
-    if not room_rev:
-        # 更新：添加詳細日誌以除錯
-        logs.append("Debug: No room at point {} with offset {} or -{}".format(point_on_face, EPSILON, EPSILON))
-    return room_rev
+    for eps in EPSILONS:
+        # 正方向偏移
+        offset_vector = normal.Multiply(eps)
+        offset_point = point_on_face.Add(offset_vector)
+        room = doc.GetRoomAtPoint(offset_point, phase)
+        if room:
+            return room
+        # 負方向偏移
+        offset_vector_rev = normal.Multiply(-eps)
+        offset_point_rev = point_on_face.Add(offset_vector_rev)
+        room_rev = doc.GetRoomAtPoint(offset_point_rev, phase)
+        if room_rev:
+            return room_rev
+    # 如果皆無，記錄最後點
+    logs.append("Debug: No room at point {} with offsets {} or negatives.".format(point_on_face, EPSILONS))
+    return None
 
 def calculate_room_height(room):
-    """從房間的 'Headroom Requirement' 參數（Text, Instance）計算高度"""
+    """從房間的 'Headroom Requirement' 參數（Text, Instance）計算高度（轉 ft）"""
     if room:
         param = room.LookupParameter("Headroom Requirement")  # 查找參數
         if param and param.StorageType == StorageType.String:
             value = param.AsString()
             try:
-                height = float(value)  # 轉換 Text 為 float
-                return height
+                height_mm = float(value)  # 轉換 Text 為 float (假設 mm)
+                height_ft = height_mm * MM_TO_FEET  # 轉內部單位 ft
+                return height_ft
             except ValueError:
-                # 更新：記錄實際值以診斷
                 logs.append("Invalid height value '{}' for room {}".format(value if value else "None", room.Id))
                 return None
         else:
@@ -100,8 +106,10 @@ def create_split_profile(face, height):
     # 找最小/最大 Z，假設垂直矩形
     min_z = min(curve.GetEndPoint(0).Z for curve in curves)
     max_z = max(curve.GetEndPoint(0).Z for curve in curves)
+    wall_height = max_z - min_z
     
-    if height >= (max_z - min_z) or height <= 0:
+    if height >= wall_height or height <= 0:
+        logs.append("Invalid profile: Height {} ft exceeds or equals wall height {} ft.".format(height, wall_height))
         return None  # 無效高度
     
     new_height_z = min_z + height
