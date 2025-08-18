@@ -1,9 +1,9 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.7
+# 版本：1.8
 # 作者：Kenneth Law
-# 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float，假設 mm 轉 ft），並分割面從底部到該高度。
+# 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float，mm 轉 ft），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
-# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。優化輪廓創建以避免短曲線錯誤。
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。優化 CurveLoop 以確保連續閉合，避免不連續錯誤。
 
 import clr
 import sys
@@ -89,7 +89,7 @@ def calculate_room_height(room):
         if param and param.StorageType == StorageType.String:
             value = param.AsString()
             try:
-                height_mm = float(value)  # 轉換 Text 為 float (假設 mm)
+                height_mm = float(value)  # 轉換 Text 為 float (mm)
                 height_ft = height_mm * MM_TO_FEET  # 轉內部單位 ft
                 return height_ft
             except ValueError:
@@ -100,7 +100,7 @@ def calculate_room_height(room):
     return None
 
 def create_split_profile(face, height):
-    """創建 CurveLoop 輪廓：從底部邊偏移到高度（處理短曲線和非矩形）"""
+    """創建 CurveLoop 輪廓：從底部邊偏移到高度（處理短曲線和連續性）"""
     try:
         # 獲取面邊界邊
         edge_loop = face.EdgeLoops.get_Item(0)  # 假設單一閉合邊界
@@ -119,61 +119,61 @@ def create_split_profile(face, height):
         new_height_z = min_z + height
         
         # 識別底部曲線：Z 接近 min_z 的邊
-        bottom_curves = []
+        bottom_loop = CurveLoop()
         for curve in curves:
             p1, p2 = curve.GetEndPoint(0), curve.GetEndPoint(1)
             if abs(p1.Z - min_z) < TOLERANCE and abs(p2.Z - min_z) < TOLERANCE:
-                bottom_curves.append(curve.Clone())  # 複製底部曲線
+                dist = p1.DistanceTo(p2)
+                if dist < TOLERANCE:
+                    logs.append("Skipping short bottom curve: Distance {} ft < tolerance.".format(dist))
+                    continue
+                bottom_loop.Append(curve.Clone())
         
-        if not bottom_curves:
-            logs.append("Invalid profile: No bottom curves found.")
+        if bottom_loop.NumberOfCurves() == 0:
+            logs.append("Invalid profile: No valid bottom curves found.")
             return None
         
-        # 創建頂曲線：偏移底部曲線到 new_height_z
-        top_curves = []
-        for curve in bottom_curves:
-            p1, p2 = curve.GetEndPoint(0), curve.GetEndPoint(1)
-            new_p1 = XYZ(p1.X, p1.Y, new_height_z)
-            new_p2 = XYZ(p2.X, p2.Y, new_height_z)
-            dist = p1.DistanceTo(p2)
-            if dist < TOLERANCE:
-                logs.append("Skipping short bottom/top curve: Distance {} ft < tolerance.".format(dist))
-                continue
-            top_curve = Line.CreateBound(new_p1, new_p2) if isinstance(curve, Line) else curve.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, height)))
-            top_curves.append(top_curve)
+        # 創建頂部 CurveLoop：偏移底部到 new_height_z
+        offset_transform = Transform.CreateTranslation(XYZ(0, 0, height))
+        top_loop = CurveLoop.CreateViaTransform(bottom_loop, offset_transform)
         
-        if not top_curves:
-            logs.append("Invalid profile: No valid top curves created.")
-            return None
-        
-        # 連接垂直線：底部端點到頂部對應端點
+        # 連接垂直線：底部端點到頂部
+        bottom_curves = list(bottom_loop)
+        top_curves = list(top_loop)
         vertical_lines = []
-        bottom_endpoints = [c.GetEndPoint(0) for c in bottom_curves] + [bottom_curves[-1].GetEndPoint(1)]  # 閉合
-        top_endpoints = [c.GetEndPoint(0) for c in top_curves] + [top_curves[-1].GetEndPoint(1)]
-        for i in range(len(bottom_endpoints) - 1):  # 避免最後閉合
-            p_bottom = bottom_endpoints[i]
-            p_top = top_endpoints[i]
-            dist = p_bottom.DistanceTo(p_top)
-            if dist < TOLERANCE:
-                logs.append("Skipping short vertical line: Distance {} ft < tolerance.".format(dist))
-                continue
-            vertical = Line.CreateBound(p_bottom, p_top)
-            vertical_lines.append(vertical)
+        for i in range(len(bottom_curves)):
+            p_bottom_start = bottom_curves[i].GetEndPoint(0)
+            p_top_start = top_curves[i].GetEndPoint(0)
+            dist_start = p_bottom_start.DistanceTo(p_top_start)
+            if dist_start >= TOLERANCE:
+                vertical_start = Line.CreateBound(p_bottom_start, p_top_start)
+                vertical_lines.append(vertical_start)
+            else:
+                logs.append("Skipping short vertical start: Distance {} ft < tolerance.".format(dist_start))
+            
+            p_bottom_end = bottom_curves[i].GetEndPoint(1)
+            p_top_end = top_curves[i].GetEndPoint(1)
+            dist_end = p_bottom_end.DistanceTo(p_top_end)
+            if dist_end >= TOLERANCE:
+                vertical_end = Line.CreateBound(p_bottom_end, p_top_end)
+                vertical_lines.append(vertical_end)
+            else:
+                logs.append("Skipping short vertical end: Distance {} ft < tolerance.".format(dist_end))
         
-        # 組裝 CurveLoop：底部 + 垂直 + 頂部反向 + 垂直反向（確保閉合方向）
+        # 組裝最終 CurveLoop：底部 + 垂直 + 頂部反轉 + 垂直反轉
         profile = CurveLoop()
         for c in bottom_curves:
             profile.Append(c)
-        for v in vertical_lines[::-1]:  # 反向以閉合
-            profile.Append(v)
-        for t in top_curves[::-1]:  # 反向頂部
-            profile.Append(t)
         for v in vertical_lines:
             profile.Append(v)
+        for t in reversed(top_curves):  # 反轉頂部方向以閉合
+            profile.Append(t.CreateReversed())
+        for v in reversed(vertical_lines):  # 反轉垂直以閉合
+            profile.Append(v.CreateReversed())
         
-        # 驗證 CurveLoop
+        # 驗證連續性和閉合
         if not profile.IsClosed() or not profile.IsPlanar():
-            logs.append("Invalid CurveLoop: Not closed or planar.")
+            logs.append("Invalid CurveLoop: Not closed or planar. Endpoints may not connect.")
             return None
         
         return profile
