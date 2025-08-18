@@ -1,21 +1,21 @@
-# Wall Split Face Project
+# Revit Wall Face Splitter
 
-## 概述
-這是Revit Dynamo Python腳本項目，用於自動處理模型中所有牆體：對每個側面識別相連房間，計算高度，並創建水平ModelCurve作為Split Face邊界。
+## 目的
+這個 Python 腳本在 Dynamo 中自動化 Revit 模型的牆體面分割：基於相連房間高度，從底部分割出區域。適合建築自動化，如材料應用。
 
 ## 安裝
-1. 在Dynamo中開啟Revit模型。
-2. 載入`main_script.py`作為自訂節點或直接運行。
-3. 確保config.json存在並調整參數。
+- Revit 2023 和 Dynamo 2.16.2。
+- 在 Dynamo 中創建 Python Script 節點，貼上腳本。
+- 無額外依賴；使用標準 Revit API。
 
-## 使用
-- 在Dynamo中連接輸出到其他節點。
-- 檢查LOG文件於config.json指定的路徑。
+## 使用指示
+1. 打開 Revit 模型。
+2. 在 Dynamo 中載入腳本。
+3. 運行；輸出日誌顯示結果。
+4. 測試於簡單模型，避免複雜幾何。
 
-## 依賴
-- Revit 2023
-- Dynamo 2.16.2
-- IronPython 2.7
+## 依賴項
+- Autodesk.Revit.DB
+- RevitServices
 
-## 貢獻
-歡迎PR。
+貢獻歡迎！報告問題於 Issues。
