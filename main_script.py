@@ -1,9 +1,9 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.3
+# 版本：1.4
 # 作者：Kenneth Law
 # 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
-# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。增加 EPSILON 以改善房間偵測。
 
 import clr
 import sys
@@ -34,9 +34,9 @@ doc = DocumentManager.Instance.CurrentDBDocument
 uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
 
 # 定義常量
-EPSILON = 0.01  # 小偏移用於找房間
+EPSILON = 0.1  # 更新：增加偏移用於找房間（單位依項目，通常英尺）
 logs = []  # 日誌列表：成功/失敗記錄
-log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 更新：指定 LOG 目錄
+log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 指定 LOG 目錄
 log_file_name = "log.txt"  # 指定檔案名
 log_path = os.path.join(log_dir, log_file_name)  # 完整路徑
 
@@ -60,15 +60,18 @@ def get_adjacent_room(face):
     point_on_face = face.Evaluate(uv)  # 獲取點
     normal = face.FaceNormal  # 獲取法線
     # 偏移到房間側（法線指向外，偏移正方向進入房間）
-    offset_vector = normal.Multiply(EPSILON)  # 使用 Multiply 方法
-    offset_point = point_on_face.Add(offset_vector)  # 修正：使用 Add 方法
+    offset_vector = normal.Multiply(EPSILON)
+    offset_point = point_on_face.Add(offset_vector)
     room = doc.GetRoomAtPoint(offset_point)
     if room:
         return room
     # 如果無，試反方向（視牆方向）
-    offset_vector_rev = normal.Multiply(-EPSILON)  # 使用 Multiply 方法
-    offset_point_rev = point_on_face.Add(offset_vector_rev)  # 修正：使用 Add 方法
+    offset_vector_rev = normal.Multiply(-EPSILON)
+    offset_point_rev = point_on_face.Add(offset_vector_rev)
     room_rev = doc.GetRoomAtPoint(offset_point_rev)
+    if not room_rev:
+        # 更新：添加詳細日誌以除錯
+        logs.append("Debug: No room at point {} with offset {} or -{}".format(point_on_face, EPSILON, EPSILON))
     return room_rev
 
 def calculate_room_height(room):
@@ -76,10 +79,16 @@ def calculate_room_height(room):
     if room:
         param = room.LookupParameter("Headroom Requirement")  # 查找參數
         if param and param.StorageType == StorageType.String:
+            value = param.AsString()
             try:
-                return float(param.AsString())  # 轉換 Text 為 float
+                height = float(value)  # 轉換 Text 為 float
+                return height
             except ValueError:
-                return None  # 無效字符串
+                # 更新：記錄實際值以診斷
+                logs.append("Invalid height value '{}' for room {}".format(value if value else "None", room.Id))
+                return None
+        else:
+            logs.append("Parameter 'Headroom Requirement' not found or invalid for room {}".format(room.Id))
     return None
 
 def create_split_profile(face, height):
