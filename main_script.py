@@ -1,9 +1,9 @@
 # 模組：自動分割 Revit 牆體面基於相連房間高度
-# 版本：1.6
+# 版本：1.7
 # 作者：Kenneth Law
 # 描述：遍歷所有牆體，對於每個垂直面，找相連房間，從房間的 "Headroom Requirement" 參數獲取高度（Text 轉 float，假設 mm 轉 ft），並分割面從底部到該高度。
 # 依賴：Revit 2023, Dynamo 2.16.2, IronPython
-# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。新增 ShortCurveTolerance 檢查以避免短曲線錯誤。
+# 注意：需在 Dynamo 中運行；測試於樣本模型。日誌將寫入指定路徑。優化輪廓創建以避免短曲線錯誤。
 
 import clr
 import sys
@@ -37,7 +37,7 @@ app = DocumentManager.Instance.CurrentUIApplication.Application
 # 定義常量
 EPSILONS = [0.01, 0.1, 0.5, 1.0]  # 多偏移嘗試以改善房間偵測
 MM_TO_FEET = 1 / 304.8  # 毫米到英尺轉換因子 (Revit 內部單位為 ft)
-TOLERANCE = app.ShortCurveTolerance * 1.01  # 更新：短曲線容差（稍大以安全）
+TOLERANCE = app.ShortCurveTolerance * 1.01  # 短曲線容差（稍大以安全）
 logs = []  # 日誌列表：成功/失敗記錄
 log_dir = r"D:\Users\User\Desktop\test\Wall Split Face"  # 指定 LOG 目錄
 log_file_name = "log.txt"  # 指定檔案名
@@ -100,64 +100,86 @@ def calculate_room_height(room):
     return None
 
 def create_split_profile(face, height):
-    """創建 CurveLoop 輪廓：從底部到高度的矩形（簡化假設矩形面，新增容差檢查）"""
-    # 獲取面邊界邊
-    edge_loop = face.EdgeLoops.get_Item(0)  # 假設單一閉合邊界
-    curves = [edge.AsCurve() for edge in edge_loop]
-    
-    # 提取所有唯一端點
-    points = []
-    for curve in curves:
-        points.append(curve.GetEndPoint(0))
-        points.append(curve.GetEndPoint(1))
-    points = list(set(points))  # 移除重複
-    
-    # 找最小/最大 Z
-    min_z = min(p.Z for p in points)
-    max_z = max(p.Z for p in points)
-    wall_height = max_z - min_z
-    
-    if height >= wall_height or height <= 0:
-        logs.append("Invalid profile: Height {} ft exceeds or equals wall height {} ft.".format(height, wall_height))
-        return None  # 無效高度
-    
-    new_height_z = min_z + height
-    
-    # 改善角點選擇：過濾底點 (Z ≈ min_z)，找 min/max X/Y
-    bottom_points = [p for p in points if abs(p.Z - min_z) < TOLERANCE]
-    if len(bottom_points) < 2:
-        logs.append("Invalid profile: Insufficient bottom points.")
-        return None
-    
-    bottom_left = min(bottom_points, key=lambda p: p.X + p.Y)
-    bottom_right = max(bottom_points, key=lambda p: p.X - p.Y)
-    
-    # 對應頂點：複製底點調整 Z
-    new_top_left = XYZ(bottom_left.X, bottom_left.Y, new_height_z)
-    new_top_right = XYZ(bottom_right.X, bottom_right.Y, new_height_z)
-    
-    # 創建曲線前檢查距離
-    def create_line_safe(p1, p2):
-        dist = p1.DistanceTo(p2)
-        if dist < TOLERANCE:
-            logs.append("Skipping line: Distance {} ft < tolerance {} ft.".format(dist, TOLERANCE))
+    """創建 CurveLoop 輪廓：從底部邊偏移到高度（處理短曲線和非矩形）"""
+    try:
+        # 獲取面邊界邊
+        edge_loop = face.EdgeLoops.get_Item(0)  # 假設單一閉合邊界
+        curves = [edge.AsCurve() for edge in edge_loop]
+        
+        # 計算 min/max Z
+        all_points = [p for curve in curves for p in [curve.GetEndPoint(0), curve.GetEndPoint(1)]]
+        min_z = min(p.Z for p in all_points)
+        max_z = max(p.Z for p in all_points)
+        wall_height = max_z - min_z
+        
+        if height >= wall_height or height <= 0:
+            logs.append("Invalid profile: Height {} ft exceeds or equals wall height {} ft.".format(height, wall_height))
             return None
-        return Line.CreateBound(p1, p2)
-    
-    bottom = create_line_safe(bottom_left, bottom_right)
-    left = create_line_safe(bottom_left, new_top_left)
-    top = create_line_safe(new_top_left, new_top_right)
-    right = create_line_safe(new_top_right, bottom_right)
-    
-    if None in [bottom, left, top, right]:
+        
+        new_height_z = min_z + height
+        
+        # 識別底部曲線：Z 接近 min_z 的邊
+        bottom_curves = []
+        for curve in curves:
+            p1, p2 = curve.GetEndPoint(0), curve.GetEndPoint(1)
+            if abs(p1.Z - min_z) < TOLERANCE and abs(p2.Z - min_z) < TOLERANCE:
+                bottom_curves.append(curve.Clone())  # 複製底部曲線
+        
+        if not bottom_curves:
+            logs.append("Invalid profile: No bottom curves found.")
+            return None
+        
+        # 創建頂曲線：偏移底部曲線到 new_height_z
+        top_curves = []
+        for curve in bottom_curves:
+            p1, p2 = curve.GetEndPoint(0), curve.GetEndPoint(1)
+            new_p1 = XYZ(p1.X, p1.Y, new_height_z)
+            new_p2 = XYZ(p2.X, p2.Y, new_height_z)
+            dist = p1.DistanceTo(p2)
+            if dist < TOLERANCE:
+                logs.append("Skipping short bottom/top curve: Distance {} ft < tolerance.".format(dist))
+                continue
+            top_curve = Line.CreateBound(new_p1, new_p2) if isinstance(curve, Line) else curve.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, height)))
+            top_curves.append(top_curve)
+        
+        if not top_curves:
+            logs.append("Invalid profile: No valid top curves created.")
+            return None
+        
+        # 連接垂直線：底部端點到頂部對應端點
+        vertical_lines = []
+        bottom_endpoints = [c.GetEndPoint(0) for c in bottom_curves] + [bottom_curves[-1].GetEndPoint(1)]  # 閉合
+        top_endpoints = [c.GetEndPoint(0) for c in top_curves] + [top_curves[-1].GetEndPoint(1)]
+        for i in range(len(bottom_endpoints) - 1):  # 避免最後閉合
+            p_bottom = bottom_endpoints[i]
+            p_top = top_endpoints[i]
+            dist = p_bottom.DistanceTo(p_top)
+            if dist < TOLERANCE:
+                logs.append("Skipping short vertical line: Distance {} ft < tolerance.".format(dist))
+                continue
+            vertical = Line.CreateBound(p_bottom, p_top)
+            vertical_lines.append(vertical)
+        
+        # 組裝 CurveLoop：底部 + 垂直 + 頂部反向 + 垂直反向（確保閉合方向）
+        profile = CurveLoop()
+        for c in bottom_curves:
+            profile.Append(c)
+        for v in vertical_lines[::-1]:  # 反向以閉合
+            profile.Append(v)
+        for t in top_curves[::-1]:  # 反向頂部
+            profile.Append(t)
+        for v in vertical_lines:
+            profile.Append(v)
+        
+        # 驗證 CurveLoop
+        if not profile.IsClosed() or not profile.IsPlanar():
+            logs.append("Invalid CurveLoop: Not closed or planar.")
+            return None
+        
+        return profile
+    except Exception as e:
+        logs.append("Error creating profile: {}".format(str(e)))
         return None
-    
-    profile = CurveLoop()
-    profile.Append(bottom)
-    profile.Append(right)
-    profile.Append(top)
-    profile.Append(left)
-    return profile
 
 # 主邏輯
 TransactionManager.Instance.EnsureInTransaction(doc)
